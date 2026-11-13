@@ -1,39 +1,61 @@
 import { build } from 'esbuild';
-import { dirname, resolve } from 'node:path';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
 
-const root=resolve(import.meta.dirname,'..');
-const out=resolve(root,'skills/chat-3d-viewer/assets/native-runtime.bundle.js');
-await mkdir(dirname(out),{recursive:true});
-await build({
-  entryPoints:[resolve(root,'src/three-bridge.mjs')],
-  outfile:out,
-  bundle:true,
-  format:'iife',
-  globalName:'ChatInspectorThree',
-  platform:'browser',
-  target:['es2022'],
-  minify:true,
-  legalComments:'none',
-  logLevel:'info',
-});
-const bytes=(await readFile(out)).length;
-console.log('Native bundle bytes:',bytes);
+const root = resolve(import.meta.dirname, '..');
+const entries = {
+  native: './box-entry.mjs',
+  mesh: './three-bridge.mjs',
+  gltf: './gltf-entry.mjs',
+  splat: './splat-raw-entry.mjs',
+  'splat-ply': './splat-ply-entry.mjs',
+};
 
-// Optional network-loaded runtime: keep real model data and the bridge
-// self-contained, while loading standard upstream modules from a CDN.
-// Bare imports are resolved by the page's importmap, not by fetch().
-const cdnOut=resolve(root,'skills/chat-3d-viewer/assets/native-runtime.cdn.mjs');
-await build({
-  entryPoints:[resolve(root,'src/cdn-entry.mjs')],
-  outfile:cdnOut,
-  bundle:true,
-  packages:'external',
-  format:'esm',
-  platform:'browser',
-  target:['es2022'],
-  minify:true,
-  legalComments:'none',
-  logLevel:'info',
-});
-console.log('CDN bridge bytes:',(await readFile(cdnOut)).length);
+// r186 projects every covariance with a perspective Jacobian. An orthographic
+// camera's screen-space derivative is constant in x/y and zero in z. Keep the
+// upstream shader, sorting, SH evaluation and buffers for both backends.
+function splatProjection() {
+  const path = resolve(root, 'node_modules/three/examples/jsm/objects/GaussianSplat.js');
+  return {name:'splat-projection', setup(plugin) {
+    plugin.onResolve({filter:/^three\/addons\/objects\/GaussianSplat\.js$/}, () => ({path}));
+    plugin.onLoad({filter:/GaussianSplat\.js$/}, async () => {
+      let source = await readFile(path,'utf8');
+      function replace(from, to) {
+        if (!source.includes(from)) throw Error('Recheck the splat projection against the pinned Three.js source.');
+        source = source.replace(from,to);
+      }
+      replace("const j00 = ", "const orthographic = cameraProjectionMatrix[ 2 ].w.equal( 0 );\n\t\tconst j00 = ");
+      for (const axis of ['x','y']) {
+        const diagonal = `focal.${axis}.negate().mul( invZ )`;
+        replace(diagonal, `orthographic.select( focal.${axis}, ${diagonal} )`);
+        const depth = `focal.${axis}.mul( viewCenter.${axis} ).mul( invZ2 )`;
+        replace(depth, `orthographic.select( 0, ${depth} )`);
+      }
+      // Keep these dependencies as ordinary addon imports in CDN mode.
+      source = source.replaceAll("from '../", "from 'three/addons/");
+      return {contents:source, resolveDir:root};
+    });
+  }};
+}
+
+for (const [name, source] of Object.entries(entries)) {
+  for (const cdn of [false, true]) {
+    const suffix = cdn ? 'cdn.mjs' : 'bundle.js';
+    const outfile = resolve(root, 'skills/chat-3d-viewer/assets', name + '-runtime.' + suffix);
+    // Both delivery modes share one entry. The CDN build leaves only actual
+    // package imports external; esbuild follows local adapter imports.
+    const contents = cdn
+      ? `import { createThreeViewer } from '${source}';
+         globalThis.ChatInspectorThree = { createThreeViewer };
+         globalThis.__chat3dCDNReady?.resolve();`
+      : `export { createThreeViewer } from '${source}';`;
+    await build({
+      stdin: { contents, sourcefile: 'runtime-bootstrap.mjs', resolveDir: resolve(root, 'src') },
+      plugins: name.startsWith('splat') ? [splatProjection()] : [],
+      outfile, bundle: true, packages: cdn ? 'external' : 'bundle',
+      format: cdn ? 'esm' : 'iife', globalName: cdn ? undefined : 'ChatInspectorThree',
+      platform: 'browser', target: ['es2022'], minify: true, legalComments: 'none',
+    });
+    console.log(name, suffix, (await readFile(outfile)).length, 'bytes');
+  }
+}

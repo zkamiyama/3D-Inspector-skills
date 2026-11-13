@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Build a single-file, network-free 3D Inspector view for ChatGPT/artifact previews.
-
-Supports GLB/GLTF/OBJ/PLY/STL/3MF through trimesh and Box Impostor .box.zip.
-The latter is deliberately an approximate geometric reconstruction, not the
-three-impostor raymarch renderer. Geometry and counts are marked accordingly.
-"""
+"""Build a portable HTML inspector with a runtime selected from the asset contents."""
 from __future__ import annotations
 import argparse
 import base64
@@ -13,16 +8,21 @@ import io
 import json
 from pathlib import Path
 import re
-import struct
+import os
+import shutil
+import subprocess
+import tempfile
 import sys
 import zipfile
 import zlib
+
+from viewer_dependencies import MissingViewerDependency
 
 import numpy as np
 from PIL import Image
 
 VERSION = 1
-FORMATS = {'.glb', '.gltf', '.obj', '.stl', '.ply', '.3mf'}
+FORMATS = {'.glb', '.gltf', '.obj', '.stl', '.ply', '.3mf', '.off', '.xyz', '.dae'}
 FACES = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
 CHANNEL_MAPS = {'colorMap': 'Base color', 'normalMap': 'Normal', 'intervalMap': 'Intervals',
                 'rangeMap': 'Depth range', 'materialMap': 'R: roughness · G: metallic · B: AO',
@@ -69,26 +69,82 @@ def quantized_color(value):
     return np.clip(list(a[:4]) + [1] * (4-len(a[:4])), 0, 1).tolist()
 
 
-def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
+def point_object(name, vertices, colors, limit):
+    points = np.asarray(vertices, dtype=np.float32)
+    if not len(points) or not finite(points):
+        raise ValueError('Point coordinates must be finite and nonempty')
+    # Evenly sample the full input, including its endpoints.
+    selection = slice(None) if len(points) <= limit else np.linspace(
+        0, len(points) - 1, limit, dtype=np.int64)
+    obj = dict(name=clean_name(name), primitive='points', material=0,
+               positions=buffer64(points[selection], '<f4'))
+    if colors is not None and len(colors) == len(points):
+        rgba = np.asarray(colors, dtype=np.uint8)
+        if rgba.shape == (len(points), 3):
+            rgba = np.column_stack((rgba, np.full(len(points), 255, dtype=np.uint8)))
+        if rgba.shape == (len(points), 4):
+            obj['colors'] = buffer64(rgba[selection], 'u1')
+    return obj
+
+
+def point_colors(mesh):
+    # Gaussian-splat PLY often stores only SH coefficients, scale and opacity.
+    # Its center preview can still show the actual degree-zero color.
+    vertex = mesh.metadata.get('_ply_raw', {}).get('vertex', {})
+    fields = vertex.get('properties', {})
+    splats = all(key in fields for key in ('f_dc_0', 'f_dc_1', 'f_dc_2', 'scale_0', 'rot_0', 'opacity'))
+    if splats:
+        data = vertex['data']
+        dc = np.column_stack([data['f_dc_' + str(i)] for i in range(3)])
+        if not finite(dc):
+            raise ValueError('Gaussian color coefficients must be finite')
+        colors = np.rint(np.clip(0.5 + 0.28209479177387814 * dc, 0, 1) * 255)
+        return colors.astype(np.uint8), True
+    return mesh.colors, False
+
+
+def xyz_scene(path, point_limit):
+    # XYZ has no header. Extra columns are accepted only in the XYZRGB[A]
+    # layouts to avoid silently treating normals or intensity as a color.
+    values = np.loadtxt(path, dtype=np.float64, ndmin=2)
+    if values.shape[1] not in (3, 6, 7) or not len(values) or not finite(values):
+        raise ValueError('Expected XYZ coordinates, optionally followed by RGB or RGBA')
+    points = values[:, :3]
+    colors = values[:, 3:]
+    if colors.size:
+        if colors.min() < 0 or colors.max() > 255:
+            raise ValueError('XYZ colors must be in the range 0–1 or 0–255')
+        colors = np.round(colors * (255 if colors.max() <= 1 else 1))
+    obj = point_object(path.stem, points, colors if colors.size else None, point_limit)
+    return finalize_scene(path.stem, 'XYZ', [obj], [], [], description='Point cloud',
+                          previewType='points', unit='model', fixed_bounds=(points.min(axis=0), points.max(axis=0)),
+                          original=dict(vertices=len(points), triangles=0))
+
+
+def glb_scene(path, *, limit=250_000, point_limit=500_000, texture_size=MAX_TEXTURE_SIZE, loaded_scene=None):
     try:
         import trimesh
     except ImportError as exc:
         raise SystemExit('Missing trimesh. Install with: pip install numpy pillow trimesh') from exc
     if path.stat().st_size > MAX_INPUT:
         raise ValueError('Input file exceeds the 512 MiB limit')
-    loaded = trimesh.load(str(path), force='scene', process=False)
+    loaded = loaded_scene if loaded_scene is not None else trimesh.load(str(path), force='scene', process=False)
     if isinstance(loaded, trimesh.Trimesh):
         scene = trimesh.Scene(loaded)
     else:
         scene = loaded
     textures, materials, meshes = [], [], []
     material_cache = {}
+    has_splat_centers = False
     source_vertex_total = 0
     source_triangle_total = 0
     for node_name in sorted(scene.graph.nodes_geometry):
         transform, geometry_name = scene.graph.get(node_name)
         mesh = scene.geometry[geometry_name]
-        if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+        is_cloud = isinstance(mesh, trimesh.points.PointCloud)
+        if not is_cloud and not isinstance(mesh, trimesh.Trimesh):
+            continue
+        if not len(mesh.vertices) or (not is_cloud and not len(mesh.faces)):
             continue
         v = np.asarray(mesh.vertices, dtype=np.float64)
         transform = np.asarray(transform, dtype=np.float64)
@@ -96,6 +152,17 @@ def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
         vertices = vertices[:, :3]
         if not finite(vertices):
             raise ValueError('Mesh coordinates must be finite')
+        if is_cloud:
+            colors, gaussian = point_colors(mesh)
+            has_splat_centers |= gaussian
+            obj = point_object(node_name, vertices, colors, point_limit)
+            if 'point-color' not in material_cache:
+                material_cache['point-color'] = len(materials)
+                materials.append(dict(name='Point colors', baseColor=[1, 1, 1, 1], alphaMode='OPAQUE'))
+            obj['material'] = material_cache['point-color']
+            meshes.append(obj)
+            source_vertex_total += len(vertices)
+            continue
         # Material is keyed by node AND material object; submeshes can reuse.
         visual = mesh.visual
         matobj = getattr(visual, 'material', None)
@@ -138,7 +205,8 @@ def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
         if not finite(vertex_normal):
             vertex_normal[:] = [0,1,0]
         uv = getattr(visual, 'uv', None)
-        if uv is None or len(uv) != len(v):
+        has_uv = uv is not None and len(uv) == len(v)
+        if not has_uv:
             uv = np.zeros((len(v),2), dtype=np.float32)
         else:
             uv = np.asarray(uv, dtype=np.float32)
@@ -154,6 +222,9 @@ def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
             idx = np.arange(len(vertices),dtype=np.uint32)
         else:
             colors = np.full((len(vertices),4),255,dtype=np.uint8)
+        if np.linalg.det(transform[:3, :3]) < 0:
+            # Baking a reflection into positions reverses the geometric winding.
+            idx = idx.reshape(-1, 3)[:, [0, 2, 1]].reshape(-1)
         # WebGL2 multiplies true vertex colors by the texture. Canvas2D uses
         # a separate UV-sampled color approximation when textures are present.
         webgl_colors = np.array(colors,copy=True)
@@ -169,19 +240,28 @@ def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
         # Limit using deterministic face stride (no random sampling).
         if len(idx)//3 > limit:
             step = int(np.ceil((len(idx)//3)/limit))
-            faces = np.asarray(mesh.faces[::step], dtype=np.uint32)
+            faces = idx.reshape(-1, 3)[::step]
             used, inverse = np.unique(faces.ravel(), return_inverse=True)
             idx = inverse.astype(np.uint32)
             vertices, vertex_normal, uv, colors, webgl_colors = (vertices[used],vertex_normal[used],
                 uv[used],colors[used],webgl_colors[used])
-        meshes.append(dict(name=clean_name(node_name), material=mi, positions=buffer64(vertices,np.float32),
-                           indices=buffer64(idx,np.uint32), normals=buffer64(vertex_normal,np.float32),
-                           uv=buffer64(uv,np.float32), colors=buffer64(webgl_colors,np.uint8),
-                           fallbackColors=buffer64(colors,np.uint8)))
+        obj = dict(name=clean_name(node_name), material=mi, positions=buffer64(vertices, '<f4'),
+                   indices=buffer64(idx, '<u4'), normals=buffer64(vertex_normal, '<f4'))
+        if has_uv:
+            obj['uv'] = buffer64(uv, '<f4')
+        if np.any(webgl_colors != 255):
+            obj['colors'] = buffer64(webgl_colors, 'u1')
+        if not np.array_equal(colors, webgl_colors):
+            obj['fallbackColors'] = buffer64(colors, 'u1')
+        meshes.append(obj)
     if not meshes:
-        raise ValueError('No triangle meshes were found in the asset')
-    return finalize_scene(path.stem,path.suffix.lstrip('.').upper(),meshes,materials,textures,
-                          description='Mesh asset',unit='model',original=dict(vertices=source_vertex_total,triangles=source_triangle_total))
+        raise ValueError('No triangle meshes or point clouds were found in the asset')
+    point_only = all(obj.get('primitive') == 'points' for obj in meshes)
+    return finalize_scene(path.stem, path.suffix.lstrip('.').upper(), meshes, materials, textures,
+                          description='Gaussian centers' if has_splat_centers else 'Point cloud' if point_only else 'Mesh asset',
+                          note='Gaussian centers and DC colors only. Splat scale, opacity and view-dependent lighting are omitted.' if has_splat_centers else None,
+                          previewType='points' if point_only else 'mesh', unit=scene.units or 'model',
+                          fixed_bounds=scene.bounds, original=dict(vertices=source_vertex_total, triangles=source_triangle_total))
 
 
 def image_from_half(data,desc,*, color=False):
@@ -308,6 +388,13 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000, na
                     tris.extend([(a,b,c),(b,d,c)])
             if not tris:continue
             vertices=np.asarray(vert,dtype=np.float32);faces=np.asarray(tris,dtype=np.uint32)
+            if len(faces) > limit:
+                faces = faces[::int(np.ceil(len(faces) / limit))]
+                used, inverse = np.unique(faces.ravel(), return_inverse=True)
+                vertices = vertices[used]
+                uvs = np.asarray(uvs)[used]
+                col = np.asarray(col)[used]
+                faces = inverse.astype(np.uint32).reshape(-1, 3)
             normals=np.zeros_like(vertices)
             for triangle in faces:
                 a,b,c=vertices[triangle]
@@ -318,7 +405,6 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000, na
             mesh_data.append(dict(name=face+' surface',material=0,positions=buffer64(vertices,np.float32),
                                   normals=buffer64(normals,np.float32),uv=buffer64(uvs,np.float32),
                                   indices=buffer64(faces.reshape(-1),np.uint32),
-                                  colors=buffer64(np.full((len(vert),4),255,dtype=np.uint8),np.uint8),
                                   fallbackColors=buffer64(np.clip(col,0,255),np.uint8)))
         if not mesh_data:raise ValueError('No visible Box surface samples')
         material=dict(name='Box atlas',baseColor=[1,1,1,1],metallic=0,roughness=1,
@@ -364,73 +450,172 @@ def finalize_scene(name,fmt,meshes,materials,textures,*,description,unit,origina
                 previewType=previewType,note=note,meshes=meshes,materials=materials,textures=textures)
 
 
+def gltf_or_mesh_scene(path, max_triangles, max_points, max_texture, renderer):
+    packed, stats = None, None
+    if path.suffix.lower() in ('.glb', '.gltf'):
+        from gltf_scene import prepare_gltf
+        packed, stats = prepare_gltf(path, max_texture)
+    options = dict(limit=max_triangles, point_limit=max_points, texture_size=max_texture)
+    if packed is not None:
+        # The Canvas2D proxy and the native viewer must see the same decoded geometry.
+        with tempfile.TemporaryDirectory(prefix='chat-3d-gltf-') as directory:
+            converted = Path(directory) / 'model.glb'
+            converted.write_bytes(packed)
+            scene = glb_scene(converted, **options)
+            scene.update(name=clean_name(path.stem), format=path.suffix[1:].upper())
+    else:
+        scene = glb_scene(path, **options)
+    if stats is not None and renderer == 'native':
+        scene['nativeGltf'] = dict(glb=base64.b64encode(packed).decode('ascii'), stats=stats)
+        scene['previewType'] = 'native-gltf'
+    return scene
+
+
+def blender_scene(path, max_triangles, max_points, max_texture, renderer):
+    blender = shutil.which('blender')
+    label = path.suffix[1:].upper()
+    if not blender:
+        raise ValueError(f'{label} input requires Blender on PATH. Alternatively, export the source as GLB.')
+    import_script = Path(__file__).resolve().with_name('blender_export.py')
+    with tempfile.TemporaryDirectory(prefix='chat-3d-blender-') as folder:
+        glb = Path(folder) / 'converted.glb'
+        result = subprocess.run(
+            [blender, '--background', '--factory-startup', '--disable-autoexec',
+             '--threads', '1', '--python-exit-code', '1', '--python', str(import_script),
+             '--', str(path), str(glb)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if result.returncode or not glb.is_file():
+            detail = (result.stdout + result.stderr).strip()[-3000:]
+            raise ValueError(f'Blender could not export {label}. ' + detail)
+        scene = gltf_or_mesh_scene(glb, max_triangles, max_points, max_texture, renderer)
+        scene.update(format=label, name=clean_name(path.stem))
+        return scene
+
+
 def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_triangles=250_000,
-          max_texture=MAX_TEXTURE_SIZE, renderer='native', runtime_source='embedded'):
-    input_file=input_file.expanduser().resolve()
-    if not input_file.is_file():raise ValueError('Input file does not exist: '+str(input_file))
+          max_texture=MAX_TEXTURE_SIZE, renderer='native', runtime_source='embedded',
+          max_points=500_000):
+    input_file = input_file.expanduser().resolve()
+    output_file = output_file.expanduser().resolve()
+    if not input_file.is_file():
+        raise ValueError('Input file does not exist: ' + str(input_file))
+    if output_file == input_file or (output_file.exists() and input_file.samefile(output_file)):
+        raise ValueError('Output must be a different file from the input')
+    if min(max_triangles, max_texture, max_points) < 1:
+        raise ValueError('Triangle, texture, and point limits must be positive')
+    if input_file.stat().st_size > MAX_INPUT:
+        raise ValueError('Input exceeds the 512 MiB limit')
     if renderer not in ('native','legacy'):
         raise ValueError('Renderer must be native or legacy')
     if runtime_source not in ('embedded','cdn'):
         raise ValueError('Runtime source must be embedded or cdn')
+    suffix = input_file.suffix.lower()
+    if suffix == '.3mf':
+        with zipfile.ZipFile(input_file) as archive:
+            if sum(entry.file_size for entry in archive.infolist()) > MAX_INPUT:
+                raise ValueError('Uncompressed 3MF exceeds the 512 MiB limit')
     if input_file.name.lower().endswith('.box.zip'):
-        scene=box_scene(input_file,grid=grid,texture_size=max_texture,limit=max_triangles,
-                        native=renderer=='native')
-    elif input_file.suffix.lower() in FORMATS:
-        scene=glb_scene(input_file,limit=max_triangles,texture_size=max_texture)
-    else:raise ValueError('Unsupported input format: '+input_file.name)
+        scene = box_scene(input_file, grid=grid, texture_size=max_texture, limit=max_triangles,
+                          native=renderer=='native')
+    elif suffix in ('.ply', '.splat'):
+        from splat_scene import gaussian_ply, read_splats
+        if suffix == '.splat' or gaussian_ply(input_file):
+            scene = read_splats(input_file, max_points, renderer == 'native')
+        else:
+            scene = glb_scene(input_file, limit=max_triangles, point_limit=max_points, texture_size=max_texture)
+    elif suffix == '.xyz':
+        scene = xyz_scene(input_file, max_points)
+    elif suffix in ('.usd', '.usda', '.usdc', '.usdz'):
+        try:
+            from usd_scene import usd_scene
+        except ModuleNotFoundError as exc:
+            if exc.name != 'pxr':
+                raise
+            raise MissingViewerDependency('usd-core') from exc
+        scene = glb_scene(input_file, limit=max_triangles, point_limit=max_points, texture_size=max_texture,
+                          loaded_scene=usd_scene(input_file))
+        scene['unit'] = 'meters'
+        scene['note'] = ('Static USD preview at the stage start time. Meshes, point clouds and common shape primitives '
+                         'are shown. Subdivision, skinning, animated playback and shader graphs are not evaluated.')
+    elif suffix in ('.stp', '.step', '.igs', '.iges', '.brep'):
+        try:
+            from cad_scene import cad_scene
+        except ModuleNotFoundError as exc:
+            if exc.name != 'OCP':
+                raise
+            raise MissingViewerDependency('OpenCASCADE') from exc
+        scene = glb_scene(input_file, limit=max_triangles, point_limit=max_points, texture_size=max_texture,
+                          loaded_scene=cad_scene(input_file))
+        scene['unit'] = 'model units' if suffix == '.brep' else 'mm'
+        scene['description'] = 'Tessellated CAD'
+        scene['note'] = 'Tessellated CAD geometry. Counts describe the tessellation. Part colors and drafting annotations are omitted.'
+    elif suffix in ('.fbx', '.blend'):
+        scene = blender_scene(input_file, max_triangles, max_points, max_texture, renderer)
+    elif suffix in FORMATS:
+        scene = gltf_or_mesh_scene(input_file, max_triangles, max_points, max_texture, renderer)
+    else:
+        raise ValueError('Unsupported input format: ' + input_file.name)
     if title:scene['name']=clean_name(title)
     data=json.dumps(scene,ensure_ascii=False,separators=(',',':'),allow_nan=False).replace('</script>','<\\/script>')
     compressed=zlib.compress(data.encode('utf-8'),level=9)
     payload=base64.b64encode(compressed).decode('ascii')
-    template=Path(__file__).resolve().parent.parent/'assets/viewer.html'
-    html=template.read_text(encoding='utf-8').replace('__SCENE_PAYLOAD__',payload)
-    # Three.js, OrbitControls and three-impostor are compiled once at Skill
-    # release time from pinned NPM packages. No runtime CDN or scripts needed.
-    runtime=Path(__file__).resolve().parent.parent/'assets/native-runtime.bundle.js'
-    if renderer=='native':
-        if not runtime.is_file():
-            raise FileNotFoundError('Bundled Three.js runtime missing: '+str(runtime))
-        code=runtime.read_text(encoding='utf-8').replace('</script>','<\\/script>')
-    else:
-        code=''
-    if renderer=='native' and runtime_source=='cdn':
-        js_file=Path(__file__).resolve().parent.parent/'assets/native-runtime.cdn.mjs'
-        if not js_file.is_file():
-            raise FileNotFoundError('CDN bridge missing: '+str(js_file))
-        imports={'imports':{
-          'three':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.webgpu.js',
-          'three/webgpu':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.webgpu.js',
-          'three/tsl':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.tsl.js',
-          'three/addons/':'https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/',
-          'three-impostor':'https://cdn.jsdelivr.net/npm/three-impostor@0.4.1/Impostor.js',
-        }}
+    assets = Path(__file__).resolve().parent.parent / 'assets'
+    html = (assets / 'viewer.html').read_text(encoding='utf-8').replace('__SCENE_PAYLOAD__', payload)
+    profile = 'native' if 'nativeBox' in scene else 'gltf' if 'nativeGltf' in scene else 'mesh'
+    if 'nativeSplat' in scene:
+        profile = scene['nativeSplat']['profile']
+    code = ''
+    if renderer == 'native':
+        suffix = 'cdn.mjs' if runtime_source == 'cdn' else 'bundle.js'
+        runtime = assets / f'{profile}-runtime.{suffix}'
+        code = runtime.read_text(encoding='utf-8').replace('</script>', '<\\/script>')
+    if renderer == 'native' and runtime_source == 'cdn':
+        three = 'https://cdn.jsdelivr.net/npm/three@0.186.0/'
+        modules = {'three': three + 'build/three.webgpu.js',
+                   'three/webgpu': three + 'build/three.webgpu.js',
+                   'three/addons/': three + 'examples/jsm/'}
+        if profile in ('native', 'splat', 'splat-ply'):
+            modules['three/tsl'] = three + 'build/three.tsl.js'
+        if profile == 'native':
+            modules['three-impostor'] = 'https://cdn.jsdelivr.net/npm/three-impostor@0.4.1/Impostor.js'
+        imports = {'imports': modules}
         bootstrap=(
             '<script type="importmap">'+json.dumps(imports,separators=(',',':'))+'</script>\n'
             '<script>globalThis.ChatInspectorRuntimeReady=new Promise(resolve=>{'
             'let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;resolve(false)}},16000);'
             'globalThis.__chat3dCDNReady={resolve:()=>{if(!settled){settled=true;clearTimeout(timer);resolve(true)}}};'
             '});</script>\n'
-            '<script type="module">'+js_file.read_text(encoding='utf-8').replace('</script>','<\\/script>')+'</script>'
+            '<script type="module">'+code+'</script>'
         )
         html=html.replace('<script>__NATIVE_RUNTIME_JS__</script>',bootstrap)
         html=html.replace('No network requests · Self-contained scene','CDN modules · Embedded scene data')
     else:
         html=html.replace('__NATIVE_RUNTIME_JS__',code)
-    notices=(Path(__file__).resolve().parent.parent/'assets/THIRD_PARTY_LICENSES.txt').read_text(encoding='utf-8')
-    html=html.replace('__THIRD_PARTY_LICENSES__', notices.replace('-->','-- >') if renderer=='native' else 'Legacy-only preview')
-    output_file=output_file.expanduser().resolve()
-    output_file.parent.mkdir(parents=True,exist_ok=True)
-    output_file.write_text(html,encoding='utf-8')
-    fallback_vertices=sum(len(base64.b64decode(m['positions']))//12 for m in scene['meshes'])
-    fallback_triangles=sum(len(base64.b64decode(m['indices']))//12 for m in scene['meshes'])
-    native_box='nativeBox' in scene
-    return dict(file=str(output_file),size=output_file.stat().st_size,
-                vertices=24 if native_box else fallback_vertices,
-                triangles=12 if native_box else fallback_triangles,
-                meshes=1 if native_box else len(scene['meshes']),
-                materials=len(scene['materials']),textures=len(scene['textures']),
-                fallbackVertices=fallback_vertices if native_box else None,
-                fallbackTriangles=fallback_triangles if native_box else None,
+    notices = (assets / 'THIRD_PARTY_LICENSES.txt').read_text(encoding='utf-8')
+    if profile != 'native':
+        notices = notices.partition('\nthree-impostor ')[0].rstrip()
+    html = html.replace('__THIRD_PARTY_LICENSES__', notices.replace('-->', '-- >') if renderer == 'native' else 'Canvas 2D')
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # Publish the complete file atomically; a failed write leaves an earlier viewer usable.
+    with tempfile.TemporaryDirectory(dir=output_file.parent, prefix='.chat-3d-') as folder:
+        temp_path = Path(folder) / 'output.html'
+        temp_path.write_text(html, encoding='utf-8')
+        if output_file.is_file():
+            temp_path.chmod(output_file.stat().st_mode & 0o777)
+        os.replace(temp_path, output_file)
+    fallback_vertices = sum(len(base64.b64decode(m['positions'])) // 12 for m in scene['meshes'])
+    fallback_triangles = sum(len(base64.b64decode(m.get('indices', ''))) // 12 for m in scene['meshes'])
+    native_box = 'nativeBox' in scene
+    stats = scene.get('nativeGltf', {}).get('stats', {})
+    has_proxy = native_box or bool(stats)
+    return dict(file=str(output_file), size=output_file.stat().st_size,
+                vertices=24 if native_box else stats.get('vertices', fallback_vertices),
+                triangles=12 if native_box else stats.get('triangles', fallback_triangles),
+                meshes=1 if native_box else stats.get('meshes', len(scene['meshes'])),
+                materials=stats.get('materials', len(scene['materials'])), textures=len(scene['textures']),
+                runtimeProfile=(('box' if profile == 'native' else profile) if renderer=='native' else 'canvas'),
+                fallbackVertices=fallback_vertices if has_proxy else None,
+                fallbackTriangles=fallback_triangles if has_proxy else None,
                 sourceVertices=scene['original'].get('vertices'),
                 sourceTriangles=scene['original'].get('triangles'),
                 renderer='Three.js / three-impostor' if native_box else ('Three.js' if renderer=='native' else 'legacy'),
@@ -439,11 +624,13 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Build a standalone, offline 3D Inspector HTML')
-    parser.add_argument('input',type=Path,help='.glb, .gltf, .obj, .stl, .ply, .3mf, or .box.zip')
-    parser.add_argument('-o','--output',type=Path,help='Output .html (default: input-stem.inspector.html)')
+    parser.add_argument('input',type=Path,help='Model: GLB, glTF, OBJ, STL, PLY, SPLAT, 3MF, OFF, XYZ, DAE, STEP, IGES, BREP, USD/USDA/USDC/USDZ, FBX/BLEND (via Blender) or .box.zip')
+    parser.add_argument('-o','--output',type=Path,help='Output file (default: INPUT_NAME.inspector.html in the current directory)')
     parser.add_argument('--title',help='Optional display title')
     parser.add_argument('--grid',type=int,default=72,help='Box ZIP sampling grid 8–256 (default 72)')
     parser.add_argument('--max-triangles',type=int,default=250_000,help='Per mesh face cap')
+    parser.add_argument('--max-points',type=int,default=500_000,help='Per point-cloud vertex cap')
+    parser.add_argument('--path-only',action='store_true',help='Print only the absolute output path')
     parser.add_argument('--max-texture',type=int,default=2048,help='Texture longest side in px')
     parser.add_argument('--runtime-source',choices=['embedded','cdn'],default='embedded',
                         help='embedded (offline) or CDN ESM imports; model data is always embedded')
@@ -451,12 +638,28 @@ def main(argv=None):
                         help='native: Three.js and native Box ray marching; legacy: approximate fallback')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
-    try: result=build(args.input,output,title=args.title,grid=args.grid,max_triangles=args.max_triangles,
-                      max_texture=args.max_texture,renderer=args.renderer,runtime_source=args.runtime_source)
+    # Some native CAD importers write diagnostics straight to file descriptor 1.
+    # Keep both the path-only protocol and the JSON protocol clean for callers.
+    sys.stdout.flush()
+    result_fd = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        try:
+            result = build(args.input, output, title=args.title, grid=args.grid,
+                           max_triangles=args.max_triangles, max_texture=args.max_texture,
+                           renderer=args.renderer, runtime_source=args.runtime_source,
+                           max_points=args.max_points)
+        finally:
+            sys.stdout.flush()
+            os.dup2(result_fd, 1)
+            os.close(result_fd)
+    except MissingViewerDependency as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.status
     except Exception as exc:
         print('Error:',str(exc),file=sys.stderr)
         return 1
-    print(json.dumps(result,ensure_ascii=False,indent=2))
+    print(result['file'] if args.path_only else json.dumps(result,ensure_ascii=False,indent=2))
     return 0
 
 
