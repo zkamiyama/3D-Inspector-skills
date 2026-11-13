@@ -1,0 +1,4 @@
+interface:
+  display_name: "3D-Inspector"
+  short_description: "Turn a 3D model into one interactive HTML"
+  default_prompt: "Use $3d-inspector to generate a standalone interactive 3D HTML viewer from my model."

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Chat 3D Inspector"
-  short_description: "Open a 3D model in one portable HTML viewer"
-  default_prompt: "Use $chat-3d-viewer to generate an interactive HTML preview of my model."
