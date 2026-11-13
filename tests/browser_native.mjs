@@ -10,6 +10,7 @@ const forceFallback=process.argv.includes('--disable-webgl');
 const opaque=process.argv.includes('--opaque');
 const allowCDN=process.argv.includes('--allow-cdn');
 const blockedFetch=process.argv.includes('--block-fetch');
+const mobile=process.argv.includes('--mobile');
 const files=process.argv.slice(2).filter(x=>!x.startsWith('--'));
 const assets=files.length?files:[
   '.test-output/synthetic-native.html',
@@ -37,7 +38,8 @@ try{
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     const port=server.address().port;
     const name=basename(asset).replace(/\.html$/,'');
-    const page=await browser.newPage({viewport:{width:1120,height:760},deviceScaleFactor:1});
+    const shotName=name+(mobile?'.mobile':'');
+    const page=await browser.newPage({viewport:mobile?{width:390,height:840}:{width:1120,height:760},deviceScaleFactor:1});
     const issues=[],outbound=[];
     if(blockedFetch)await page.addInitScript(()=>{
       window.fetch=()=>Promise.reject(new TypeError('Failed to fetch'));
@@ -64,6 +66,21 @@ try{
         return status.includes('Three.js')||status.includes('Canvas 2D')||
           document.querySelector('#error')?.classList.contains('visible');
       },null,{timeout:90000});
+      const layout=await page.evaluate(()=>{
+        const rect=id=>{const r=document.querySelector(id).getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,bottom:r.bottom,right:r.right};};
+        return {stage:rect('#stage'),toolbar:rect('.tools'),details:rect('.stats'),tabs:rect('.tabs'),
+          aside:rect('.right-pane'),header:document.querySelectorAll('.topbar').length,
+          footer:document.querySelectorAll('.footer').length,
+          overflowX:document.documentElement.scrollWidth>window.innerWidth};
+      });
+      assert.equal(layout.header,0,'The old header must be gone');
+      assert.equal(layout.footer,0,'The old footer must be gone');
+      assert.ok(layout.toolbar.x>=layout.stage.x&&layout.toolbar.y>=layout.stage.y,'Floating toolbar must overlay the viewport');
+      assert.ok(layout.toolbar.right<=layout.stage.right+1,'Floating toolbar must fit inside viewport');
+      assert.ok(layout.tabs.height<=36,'Inspector tabs must stay compact');
+      assert.ok(layout.details.height<=135,'Detail statistics must be dense');
+      assert.equal(layout.overflowX,false,'No horizontal page overflow');
+      if(mobile)assert.ok(layout.aside.y>=layout.stage.bottom-1,'Mobile inspector must stack below viewport');
       const status=await page.locator('#render-state').innerText();
       const problem=await page.locator('#error').innerText();
       if(forceFallback)assert.equal(status,'Canvas 2D');
@@ -84,7 +101,7 @@ try{
         assert.equal(state,'Native Box');
         assert.deepEqual(stats,{vertices:'24',triangles:'12',meshes:'1',materials:'1'});
       }
-      await page.screenshot({path:join(output,name+'.png')});
+      await page.screenshot({path:join(output,shotName+'.png')});
       await page.locator('[data-view="front"]').click();
       await page.locator('#projection').click();
       await page.locator('#tab-materials').click();
@@ -94,8 +111,8 @@ try{
       await page.locator('#channel').selectOption('r');
       await page.locator('#uv-overlay').check();
       await page.locator('[data-command="fit"]').click();
-      await page.screenshot({path:join(output,name+'.textures.png')});
-      console.log(JSON.stringify({asset:name,opaque,status,state,stats,
+      await page.screenshot({path:join(output,shotName+'.textures.png')});
+      console.log(JSON.stringify({asset:name,mobile,opaque,status,state,stats,layout,
         outboundCount:outbound.length,issues}));
     }finally{
       await page.close();

@@ -2,7 +2,9 @@
 
 ChatGPTやコーディングエージェントで利用できる、**独立した3Dモデル検査Skill**です。GLBなどのメッシュと、ComfyUI Box Impostor Factoryの`.box.zip`を扱えます。
 
-![歩行犬のBoxをThree.jsとthree-impostorで表示した実測画像](docs/verification/walking-dog-native.webp)
+![上部のフローティング操作パネルと高密度なDetailsを備えた歩行犬Boxの3Dビュー](docs/verification/walking-dog-compact.webp)
+
+ヘッダーとフッターを置かず、カメラと表示切替を3Dビュー内へ集約しました。右側のDetails、Materials、Texturesは狭い余白で表示します。スマートフォンでは3Dビューの下にインスペクターを配置します。
 
 ## 描画方式
 

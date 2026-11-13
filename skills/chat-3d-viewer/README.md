@@ -2,7 +2,7 @@
 
 Create **one self-contained HTML inspector** for polygon meshes and native Box Impostor assets. The output includes the model, textures and a pinned pre-bundled Three.js renderer. It needs **no network connection to display** and supports orbit, pan, zoom, screenshot, hierarchy/visibility, camera presets, material isolation and PBR texture inspection.
 
-![Native Box view](../../docs/verification/walking-dog-native.webp)
+![Native Box with compact overlay controls](../../docs/verification/walking-dog-compact.webp)
 
 ## Install
 
