@@ -78,6 +78,9 @@ button:disabled{opacity:.35;cursor:default}
 .mesh-row label{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 .mesh-row small{font:9px/1.2 var(--mono);color:var(--muted);white-space:nowrap}
 .note{background:transparent;color:var(--muted);border-top:1px solid var(--border);padding:7px 0 0;margin:8px 0 0;font-size:10px;line-height:1.4}
+.studio-controls{display:flex;align-items:center;gap:7px;margin:0 0 8px;padding:4px 0 6px;border-bottom:1px solid var(--border)}
+.studio-controls label{font-size:10px;color:var(--muted)}
+.studio-controls select{margin-left:auto;background:var(--raised);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:4px 6px;font:11px var(--font);max-width:140px}
 .material-card{width:100%;text-align:left;color:var(--text);background:transparent;border:1px solid var(--border);border-radius:6px;padding:7px 8px;margin-bottom:5px}
 .material-card:hover{background:#252828}
 .material-card[aria-pressed=true]{border-color:#7f6b50;background:#292825}
@@ -162,7 +165,7 @@ button:disabled{opacity:.35;cursor:default}
 <aside id="inspector-pane" class="right-pane" aria-label="Asset inspector">
 <div class="tabs" role="tablist" aria-label="Inspector panels"><button class="tab" id="tab-details" data-tab="details" type="button" aria-selected="true" role="tab">Details</button><button class="tab" id="tab-materials" data-tab="materials" type="button" aria-selected="false" role="tab">Materials</button><button class="tab" id="tab-textures" data-tab="textures" type="button" aria-selected="false" role="tab">Textures</button></div>
 <div class="panel" id="panel-details" role="tabpanel" aria-labelledby="tab-details"><div class="stats"><div class="stat"><span class="stat-number" id="stat-vertices">—</span><span class="stat-label">Vertices</span></div><div class="stat"><span class="stat-number" id="stat-triangles">—</span><span class="stat-label">Triangles</span></div><div class="stat"><span class="stat-number" id="stat-meshes">—</span><span class="stat-label">Meshes</span></div><div class="stat"><span class="stat-number" id="stat-materials">—</span><span class="stat-label">Materials</span></div></div><h2 class="section-title">Asset properties</h2><dl class="details-list" id="properties"></dl><h2 class="section-title">Scene hierarchy</h2><div class="hierarchy" id="mesh-list"></div><div class="note" id="asset-note" hidden></div></div>
-<div class="panel" id="panel-materials" role="tabpanel" aria-labelledby="tab-materials" hidden><h2 class="section-title">Materials <span class="muted" id="mat-count"></span></h2><div id="material-list"></div><p class="no-results" id="mat-empty" hidden>No materials in this asset.</p></div>
+<div class="panel" id="panel-materials" role="tabpanel" aria-labelledby="tab-materials" hidden><div class="studio-controls" id="studio-controls" hidden><label for="studio-lighting">Lighting</label><select id="studio-lighting" aria-label="Environment lighting"><option value="studio">Studio stripes</option><option value="neutral">Neutral</option></select></div><h2 class="section-title">Materials <span class="muted" id="mat-count"></span></h2><div id="material-list"></div><p class="no-results" id="mat-empty" hidden>No materials in this asset.</p></div>
 <div class="panel" id="panel-textures" role="tabpanel" aria-labelledby="tab-textures" hidden><h2 class="section-title">Texture assets <span class="muted" id="texture-count"></span></h2><div class="texture-list" id="texture-list"></div><div id="texture-editor" hidden><div class="texture-stage"><canvas id="texture-canvas" aria-label="Selected texture preview"></canvas></div><div class="texture-tools"><label>Channel<select id="channel"><option value="rgba">RGBA</option><option value="rgb">RGB</option><option value="r">R</option><option value="g">G</option><option value="b">B</option><option value="a">Alpha</option></select></label><label class="checkbox-label"><input type="checkbox" id="uv-overlay">UV</label></div><div class="texture-details" id="texture-details"></div></div><p class="no-results" id="texture-empty" hidden>No texture images in this asset.</p></div>
 </aside>
 </div>
@@ -324,7 +327,17 @@ function buttonPressed(id,value){$(id).setAttribute('aria-pressed',String(value)
 function setTab(name){for(const b of document.querySelectorAll('[data-tab]'))b.setAttribute('aria-selected',String(b.dataset.tab===name));for(const id of ['details','materials','textures'])$('panel-'+id).hidden=id!==name;}
 function newText(tag,value,cls){const el=document.createElement(tag);if(cls)el.className=cls;el.textContent=value;return el;}
 function infoRow(k,v){const el=newText('div','', 'details-row');el.append(newText('dt',k),newText('dd',v));return el;}
-function buildUI(){document.title=scene.name+' — 3D-Inspector';$('asset-title').textContent=scene.name;$('asset-subtitle').textContent=scene.format+' · '+(scene.description||'3D asset');const boxNative=render?.native?.isBox===true,verts=boxNative?24:meshes.reduce((a,m)=>a+m.positions.length/3,0),tris=boxNative?12:meshes.reduce((a,m)=>a+m.indices.length/3,0);for(const[k,n]of Object.entries({vertices:verts,triangles:tris,meshes:boxNative?1:meshes.length,materials:materials.length}))$('stat-'+k).textContent=format(n);$('stage-faces').textContent=boxNative?'':scene.previewType==='surface'?'Sampled surface':'';
+function buildUI(){
+const studio=render?.native;
+$('studio-controls').hidden=!studio?.supportsStudio;
+if(studio?.supportsStudio){
+  $('studio-lighting').value=studio.getStudioEnabled()?'studio':'neutral';
+  $('studio-lighting').onchange=()=>{
+    studio.setStudio($('studio-lighting').value==='studio');
+    requestFrame();
+  };
+}
+document.title=scene.name+' — 3D-Inspector';$('asset-title').textContent=scene.name;$('asset-subtitle').textContent=scene.format+' · '+(scene.description||'3D asset');const boxNative=render?.native?.isBox===true,verts=boxNative?24:meshes.reduce((a,m)=>a+m.positions.length/3,0),tris=boxNative?12:meshes.reduce((a,m)=>a+m.indices.length/3,0);for(const[k,n]of Object.entries({vertices:verts,triangles:tris,meshes:boxNative?1:meshes.length,materials:materials.length}))$('stat-'+k).textContent=format(n);$('stage-faces').textContent=boxNative?'':scene.previewType==='surface'?'Sampled surface':'';
 const dims=scene.bounds.max.map((n,i)=>n-scene.bounds.min[i]);const properties=$('properties');for(const[k,v]of [['Format',scene.format],['Dimensions',dims.map(x=>Number(x.toFixed(3))).join(' × ')],['Source vertices',scene.original?.vertices==null?'—':format(scene.original.vertices)],['Source triangles',scene.original?.triangles==null?'—':format(scene.original.triangles)],['Texture maps',String(textures.length)],['Unit',scene.unit||'model']])properties.append(infoRow(k,v));
 if(scene.previewType==='points'||scene.previewType==='gaussian'){
   $('normals').disabled=true;$('wireframe').disabled=true;
