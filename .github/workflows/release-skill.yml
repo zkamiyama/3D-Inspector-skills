@@ -1,0 +1,82 @@
+name: Publish 3D-Inspector Skill
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-skill.yml"
+      - "skills/3d-inspector/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-3d-inspector-skill
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Package and verify the complete Skill
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=zip --prefix=3d-inspector/ -o skill.zip HEAD:skills/3d-inspector
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path("skills/3d-inspector")
+          required = ["SKILL.md", "agents/openai.yaml", "view.py", "assets/viewer.html", "scripts/build_viewer.py"]
+          for relative in required:
+              if not (root / relative).is_file():
+                  raise SystemExit(f"Missing required file: {relative}")
+
+          source = {
+              "3d-inspector/" + path.relative_to(root).as_posix(): path
+              for path in root.rglob("*")
+              if path.is_file()
+          }
+          with ZipFile("skill.zip") as archive:
+              contents = {name for name in archive.namelist() if not name.endswith("/")}
+              if contents != set(source):
+                  raise SystemExit(f"Archive mismatch: missing={set(source) - contents}, extra={contents - set(source)}")
+              for name, path in source.items():
+                  if archive.read(name) != path.read_bytes():
+                      raise SystemExit(f"File differs from repository: {name}")
+          print(f"Verified {len(source)} original files in skill.zip")
+          PY
+
+      - name: Determine Skill version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^  version: //p' skills/3d-inspector/SKILL.md | head -n 1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Could not read a valid version from SKILL.md" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=3d-inspector-v$version" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; not overwriting a published version."
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" skill.zip \
+            --target "$GITHUB_SHA" \
+            --title "3D-Inspector v${VERSION}" \
+            --notes "Installable ChatGPT Skill archive (skill.zip). Includes the complete original skills/3d-inspector directory, including JavaScript bundles and WASM. Source commit: ${GITHUB_SHA}."
+          gh release view "$RELEASE_TAG" --json url --jq '.url'
