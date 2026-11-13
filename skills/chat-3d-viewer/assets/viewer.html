@@ -125,6 +125,9 @@ async function main(){
     }));
     if(!meshes.length)throw Error('The asset contains no triangle meshes');
     await initializeTextures();
+    if(globalThis.ChatInspectorRuntimeReady){
+      await globalThis.ChatInspectorRuntimeReady;
+    }
     if(typeof ChatInspectorThree!=='undefined' && ChatInspectorThree.createThreeViewer){
       try{
         const viewer=await ChatInspectorThree.createThreeViewer({

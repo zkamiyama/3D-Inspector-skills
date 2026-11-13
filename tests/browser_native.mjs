@@ -8,6 +8,8 @@ import { chromium } from 'playwright';
 
 const forceFallback=process.argv.includes('--disable-webgl');
 const opaque=process.argv.includes('--opaque');
+const allowCDN=process.argv.includes('--allow-cdn');
+const blockedFetch=process.argv.includes('--block-fetch');
 const files=process.argv.slice(2).filter(x=>!x.startsWith('--'));
 const assets=files.length?files:[
   '.test-output/synthetic-native.html',
@@ -37,6 +39,9 @@ try{
     const name=basename(asset).replace(/\.html$/,'');
     const page=await browser.newPage({viewport:{width:1120,height:760},deviceScaleFactor:1});
     const issues=[],outbound=[];
+    if(blockedFetch)await page.addInitScript(()=>{
+      window.fetch=()=>Promise.reject(new TypeError('Failed to fetch'));
+    });
     if(forceFallback)await page.addInitScript(()=>{
       const orig=HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext=function(kind,...args){
@@ -63,7 +68,11 @@ try{
       const problem=await page.locator('#error').innerText();
       if(forceFallback)assert.equal(status,'Canvas 2D');
       else assert.match(status,/Three\.js/,'Renderer is not native: '+status+' / '+problem+' / '+issues.join('; '));
-      assert.deepEqual(outbound,[],'Viewer must make no external HTTP requests');
+      if(allowCDN){
+        assert.ok(outbound.length>0,'CDN ESM should load remote modules');
+        assert.ok(outbound.every(url=>url.startsWith('https://cdn.jsdelivr.net/')),
+          'CDN variant must not fetch asset data or unknown hosts: '+JSON.stringify(outbound));
+      }else assert.deepEqual(outbound,[],'Viewer must make no external HTTP requests');
       await page.waitForTimeout(1200);
       const state=await page.locator('#stage-state').innerText();
       const stats=await page.evaluate(()=>{

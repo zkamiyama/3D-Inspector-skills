@@ -25,7 +25,7 @@ jobs:
       - name: Rebuild and check vendored Three.js runtime
         run: |
           npm run bundle
-          git diff --exit-code -- skills/chat-3d-viewer/assets/native-runtime.bundle.js
+          git diff --exit-code -- skills/chat-3d-viewer/assets/native-runtime.bundle.js skills/chat-3d-viewer/assets/native-runtime.cdn.mjs
       - name: Unit tests
         run: python -m unittest discover -s skills/chat-3d-viewer/tests -p 'test_*.py'
       - name: Generate and verify packaged Skill

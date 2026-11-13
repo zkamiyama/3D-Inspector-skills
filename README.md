@@ -18,9 +18,10 @@ GLB・glTF・OBJ・PLY・STL・3MFはtrimeshを経由してメッシュとマテ
 python -m pip install -r skills/chat-3d-viewer/requirements.txt
 python skills/chat-3d-viewer/scripts/build_viewer.py model.glb -o model.inspector.html
 python skills/chat-3d-viewer/scripts/build_viewer.py model.box.zip -o box.inspector.html
+python skills/chat-3d-viewer/scripts/build_viewer.py model.box.zip --runtime-source cdn -o box.cdn.inspector.html
 ```
 
-出力HTMLには**固定バージョンのThree.js・three-impostorとアセットの全データを含みます**。読み込んで表示する際にCDN通信、ComfyUIサーバーやGPU推論は要りません。インラインHTML実行に対応しないChatGPT環境では、ダウンロードできるHTMLとスクリーンショットを渡します。WebGL2が禁止されている場合は、Canvas2Dの簡易表示へ切り替えます。
+通常の出力HTMLは**固定バージョンのThree.js・three-impostorとアセットの全データを内包**し、CDN通信なしで表示できます。一方、サイドバーの実測でCDNの`fetch()`だけが失敗しES Moduleの`import`は成功したため、`--runtime-source cdn`も追加しました。このモードは**モデルデータをHTMLに内包したまま**、ライブラリのみCDNからインポートします。ComfyUIサーバーやGPU推論はいずれのモードでも必要ありません。インラインHTML実行に対応しないChatGPT環境では、ダウンロードできるHTMLとスクリーンショットを渡します。WebGL2が禁止されている場合は、Canvas2Dの簡易表示へ切り替えます。
 
 ### 開発・テスト
 

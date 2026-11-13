@@ -8,12 +8,13 @@ Create **one self-contained HTML inspector** for polygon meshes and native Box I
 
 Install the [released Skill ZIP](../../chat-3d-viewer-skill.zip) in a supported agent workspace, or copy this `chat-3d-viewer` folder into a coding agent's Skills directory. Installation and direct interactive HTML embedding depend on the ChatGPT account and environment; publishing a Skill does not install it automatically.
 
-The builder runs in Python with `numpy`, `Pillow` and `trimesh`:
+The builder runs in Python with `numpy`, `Pillow` and `trimesh`. The default runtime is **fully self-contained**, and an optional CDN ESM runtime is available for ChatGPT sidebar previews where JavaScript module imports work but `fetch()` is blocked:
 
 ```sh
 pip install -r requirements.txt
 python scripts/build_viewer.py /path/to/scene.glb --output /mnt/data/scene.inspector.html
 python scripts/build_viewer.py /path/to/final.box.zip --output /mnt/data/box.inspector.html
+python scripts/build_viewer.py /path/to/final.box.zip --runtime-source cdn --output /mnt/data/box.cdn.inspector.html
 ```
 
 The `native` renderer is the default. Use `--renderer legacy` for a compatibility-only Canvas2D preview. `--grid 96` changes only the sampled Box **fallback** resolution, never native raymarch quality. Source geometry is never changed.
@@ -28,7 +29,7 @@ In the right inspector, Details distinguishes source/proxy counts from rendered 
 
 ## CDN findings
 
-The pinned runtime is bundled into `assets/native-runtime.bundle.js` and copied into generated HTML at build time. No CDN or localhost server is required to open the HTML. In November 2026 testing with Edge, direct jsDelivr/unpkg/esm.sh fetches returned 200 and actual `import('three-impostor')` with an import map also succeeded in a sandboxed iframe. This does **not** prove that every ChatGPT client permits CDN requests; app-specific content security policy and network permissions vary.
+The default `embedded` runtime uses the pinned bundle `assets/native-runtime.bundle.js`, so the generated HTML requires no network. Optional `--runtime-source cdn` instead loads only the pinned standard libraries through an import map, with the Box/mesh payload still embedded in HTML (no application `fetch()`). In the user's ChatGPT sidebar test, normal `fetch()` failed, but dynamic ESM imports and WebGL2 worked. Windows Edge also rendered a native Box successfully inside a sandboxed HTML document when `window.fetch` was forcibly disabled. **These results do not guarantee CDN availability in every ChatGPT client**; app-specific network and Content Security Policy rules vary.
 
 ## Build and verify
 

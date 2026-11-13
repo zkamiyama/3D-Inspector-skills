@@ -365,11 +365,13 @@ def finalize_scene(name,fmt,meshes,materials,textures,*,description,unit,origina
 
 
 def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_triangles=250_000,
-          max_texture=MAX_TEXTURE_SIZE, renderer='native'):
+          max_texture=MAX_TEXTURE_SIZE, renderer='native', runtime_source='embedded'):
     input_file=input_file.expanduser().resolve()
     if not input_file.is_file():raise ValueError('Input file does not exist: '+str(input_file))
     if renderer not in ('native','legacy'):
         raise ValueError('Renderer must be native or legacy')
+    if runtime_source not in ('embedded','cdn'):
+        raise ValueError('Runtime source must be embedded or cdn')
     if input_file.name.lower().endswith('.box.zip'):
         scene=box_scene(input_file,grid=grid,texture_size=max_texture,limit=max_triangles,
                         native=renderer=='native')
@@ -391,7 +393,29 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         code=runtime.read_text(encoding='utf-8').replace('</script>','<\\/script>')
     else:
         code=''
-    html=html.replace('__NATIVE_RUNTIME_JS__',code)
+    if renderer=='native' and runtime_source=='cdn':
+        js_file=Path(__file__).resolve().parent.parent/'assets/native-runtime.cdn.mjs'
+        if not js_file.is_file():
+            raise FileNotFoundError('CDN bridge missing: '+str(js_file))
+        imports={'imports':{
+          'three':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.webgpu.js',
+          'three/webgpu':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.webgpu.js',
+          'three/tsl':'https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.tsl.js',
+          'three/addons/':'https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/',
+          'three-impostor':'https://cdn.jsdelivr.net/npm/three-impostor@0.4.1/Impostor.js',
+        }}
+        bootstrap=(
+            '<script type="importmap">'+json.dumps(imports,separators=(',',':'))+'</script>\n'
+            '<script>globalThis.ChatInspectorRuntimeReady=new Promise(resolve=>{'
+            'let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;resolve(false)}},16000);'
+            'globalThis.__chat3dCDNReady={resolve:()=>{if(!settled){settled=true;clearTimeout(timer);resolve(true)}}};'
+            '});</script>\n'
+            '<script type="module">'+js_file.read_text(encoding='utf-8').replace('</script>','<\\/script>')+'</script>'
+        )
+        html=html.replace('<script>__NATIVE_RUNTIME_JS__</script>',bootstrap)
+        html=html.replace('No network requests · Self-contained scene','CDN modules · Embedded scene data')
+    else:
+        html=html.replace('__NATIVE_RUNTIME_JS__',code)
     notices=(Path(__file__).resolve().parent.parent/'assets/THIRD_PARTY_LICENSES.txt').read_text(encoding='utf-8')
     html=html.replace('__THIRD_PARTY_LICENSES__', notices.replace('-->','-- >') if renderer=='native' else 'Legacy-only preview')
     output_file=output_file.expanduser().resolve()
@@ -421,12 +445,14 @@ def main(argv=None):
     parser.add_argument('--grid',type=int,default=72,help='Box ZIP sampling grid 8–256 (default 72)')
     parser.add_argument('--max-triangles',type=int,default=250_000,help='Per mesh face cap')
     parser.add_argument('--max-texture',type=int,default=2048,help='Texture longest side in px')
+    parser.add_argument('--runtime-source',choices=['embedded','cdn'],default='embedded',
+                        help='embedded (offline) or CDN ESM imports; model data is always embedded')
     parser.add_argument('--renderer',choices=['native','legacy'],default='native',
                         help='native: Three.js and native Box ray marching; legacy: approximate fallback')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
     try: result=build(args.input,output,title=args.title,grid=args.grid,max_triangles=args.max_triangles,
-                      max_texture=args.max_texture,renderer=args.renderer)
+                      max_texture=args.max_texture,renderer=args.renderer,runtime_source=args.runtime_source)
     except Exception as exc:
         print('Error:',str(exc),file=sys.stderr)
         return 1

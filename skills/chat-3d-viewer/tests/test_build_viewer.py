@@ -163,6 +163,22 @@ class BuildViewerTests(unittest.TestCase):
             self.assertNotRegex(html,r'<script[^>]+src=')
             self.assertNotIn('fetch(',html)
 
+    def test_cdn_runtime_embeds_box_without_js_fetch(self):
+        with tempfile.TemporaryDirectory() as out:
+            page=Path(out)/'cdn.html'
+            result=build(FIXTURES/'synthetic.box.zip',page,
+                         renderer='native',runtime_source='cdn')
+            html=page.read_text(encoding='utf-8')
+            scene=scene_from_html(page)
+            self.assertEqual(result['mode'],'native-box')
+            self.assertEqual(scene['nativeBox']['manifest']['resolution'],32)
+            self.assertIn('<script type="importmap">',html)
+            self.assertIn('<script type="module">',html)
+            self.assertIn('https://cdn.jsdelivr.net/npm/three-impostor@0.4.1/Impostor.js',html)
+            self.assertNotIn('fetch(',html)
+            self.assertNotIn('__NATIVE_RUNTIME_JS__',html)
+            self.assertLess(page.stat().st_size,300_000)
+
     def test_does_not_write_input_file(self):
         with tempfile.TemporaryDirectory() as out:
             source=FIXTURES/'material_study.glb'

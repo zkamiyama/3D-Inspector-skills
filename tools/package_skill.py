@@ -19,6 +19,7 @@ INCLUDE=[
     'agents/openai.yaml',
     'assets/viewer.html',
     'assets/native-runtime.bundle.js',
+    'assets/native-runtime.cdn.mjs',
     'assets/THIRD_PARTY_LICENSES.txt',
     'scripts/build_viewer.py',
 ]
