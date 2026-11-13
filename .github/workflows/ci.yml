@@ -1,0 +1,38 @@
+name: Inspector Skill
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify-skill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install -r skills/chat-3d-viewer/requirements.txt
+          npm ci
+      - name: Rebuild and check vendored Three.js runtime
+        run: |
+          npm run bundle
+          git diff --exit-code -- skills/chat-3d-viewer/assets/native-runtime.bundle.js
+      - name: Unit tests
+        run: python -m unittest discover -s skills/chat-3d-viewer/tests -p 'test_*.py'
+      - name: Generate and verify packaged Skill
+        run: |
+          python tools/package_skill.py
+          git diff --exit-code -- chat-3d-viewer-skill.zip
+      - name: Validate browser test code
+        run: |
+          node --check tests/browser_native.mjs
+          node --check tests/cdn_probe.mjs

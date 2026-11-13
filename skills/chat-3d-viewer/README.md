@@ -1,31 +1,48 @@
-# Chat 3D Inspector
+# Chat 3D Inspector Skill
 
-A reusable agent skill for building **one self-contained HTML file** to explore a 3D model. No remote JavaScript libraries, network requests, build tools, or local server are required *to view* the exported file.
+Create **one self-contained HTML inspector** for polygon meshes and native Box Impostor assets. The output includes the model, textures and a pinned pre-bundled Three.js renderer. It needs **no network connection to display** and supports orbit, pan, zoom, screenshot, hierarchy/visibility, camera presets, material isolation and PBR texture inspection.
 
-![Inspector layout](examples/material_study.inspector.webp)
+![Native Box view](../../docs/verification/walking-dog-native.webp)
 
-The viewer has camera presets, orbit/pan/zoom, screenshot export, model hierarchy and visibility, live rendered vertex/triangle/mesh/material counts, dimensions, material properties and material isolation, and a texture browser with per-channel and UV inspection. On browsers without WebGL2 it uses a simplified Canvas2D renderer; texture sampling in the viewport is only available in WebGL2.
+## Install
 
-## Install in a coding agent
+Install the [released Skill ZIP](../../chat-3d-viewer-skill.zip) in a supported agent workspace, or copy this `chat-3d-viewer` folder into a coding agent's Skills directory. Installation and direct interactive HTML embedding depend on the ChatGPT account and environment; publishing a Skill does not install it automatically.
 
-The public repository includes a ready-to-upload [Skill ZIP](../chat-3d-viewer.zip). For eligible ChatGPT workspaces, open **Plugins → Skills → Create → Upload from your computer** and choose the packaged Skill ZIP. Availability is controlled by the workspace and plan. Or copy this `chat-3d-viewer` folder to your coding agent's Skills directory, such as `~/.agents/skills/chat-3d-viewer` (Codex) or `~/.claude/skills/chat-3d-viewer` (Claude Code). In ChatGPT, make the files available to the agent through a suitable workspace or file-enabled environment. **Publishing the Skill makes it reusable, but does not automatically install it for every ChatGPT user.**
+The builder runs in Python with `numpy`, `Pillow` and `trimesh`:
 
-## Build a viewer
-
-```bash
-python -m pip install -r requirements.txt
-python scripts/build_viewer.py model.glb -o model.inspector.html
-python scripts/build_viewer.py model.box.zip --grid 96 -o model.inspector.html
+```sh
+pip install -r requirements.txt
+python scripts/build_viewer.py /path/to/scene.glb --output /mnt/data/scene.inspector.html
+python scripts/build_viewer.py /path/to/final.box.zip --output /mnt/data/box.inspector.html
 ```
 
-Read the JSON printed by the builder for real preview counts. For GLB and other polygon formats, source counts are included. For a Box Impostor `.box.zip`, preview geometry is **sampled from the six depth guides and color atlas**; the native shader can produce richer results. The viewer UI labels this distinction.
+The `native` renderer is the default. Use `--renderer legacy` for a compatibility-only Canvas2D preview. `--grid 96` changes only the sampled Box **fallback** resolution, never native raymarch quality. Source geometry is never changed.
 
-Run tests with `python -m unittest discover -s tests`, optionally `python tests/browser_smoke.py` with Playwright and Chromium for a screenshot smoke check. The included HTML examples are generated from synthetic mesh fixtures and are free to share.
+## Native Box vs fallback
 
-## Privacy and security
+For a Box `.box.zip`, the HTML contains the lossless original RGBA16F color/normal/interval/range/material atlases plus a Three.js 0.186.0 + three-impostor 0.4.1 bundle. The renderer uses the official `ImpostorNodeMaterial`, not a reimplementation of its shader. The **native Box has 24 bounding vertices / 12 boundary triangles**, not thousands of reconstructed surface triangles. The sampled surface is retained strictly for browsers without WebGL2.
 
-Assets are embedded within the exported HTML (compressed and base64-encoded); opening the viewer does not send them anywhere. Do **not** use the output for confidential models if you plan to share the HTML. The builder validates paths and checksums of Box archive members, caps data sizes, and uses text-only DOM updates to display names. For large or untrusted models, review the ZIP before processing and work in an isolated environment.
+GLB, glTF, OBJ, STL, PLY and 3MF are imported by trimesh. Native viewing uses Three.js `MeshStandardMaterial` for available base color, normal, metallic/roughness, emissive and AO resources. Some glTF extension semantics, animation/rigging and Gaussian splatting are not supported.
 
-## Credit
+In the right inspector, Details distinguishes source/proxy counts from rendered counts; Materials shows available PBR inputs and lets you isolate a material; Textures lists PNG visualizations with R/G/B/A channel and UV views. The original Box atlas bytes remain intact for native display; the texture-view thumbnails are 8-bit PNG previews.
 
-The original UI and exporter are new code. The design audit and visual discipline were informed by [unslop](https://github.com/heydamir/unslop), created by Damir Sokolovsky, licensed [CC BY 4.0](https://github.com/heydamir/unslop/blob/main/LICENSE).
+## CDN findings
+
+The pinned runtime is bundled into `assets/native-runtime.bundle.js` and copied into generated HTML at build time. No CDN or localhost server is required to open the HTML. In November 2026 testing with Edge, direct jsDelivr/unpkg/esm.sh fetches returned 200 and actual `import('three-impostor')` with an import map also succeeded in a sandboxed iframe. This does **not** prove that every ChatGPT client permits CDN requests; app-specific content security policy and network permissions vary.
+
+## Build and verify
+
+The pinned NPM dependencies and developer commands live in the repository root:
+
+```sh
+npm ci
+npm run bundle
+npm run test:browser
+npm run probe:cdn
+python -m unittest discover -s tests -p 'test_*.py'
+python ../../tools/package_skill.py
+```
+
+Use a browser smoke test to verify normal rendering, camera controls, Textures and fallback. For unauthenticated, untrusted assets, audit archives for path traversal and oversized members first. Source files remain unmodified.
+
+Bundled Three.js and three-impostor carry MIT notices under `assets/THIRD_PARTY_LICENSES.txt`. The UI direction borrows design principles from [unslop](https://github.com/heydamir/unslop), Damir Sokolovsky (CC BY 4.0); the viewer code is original.

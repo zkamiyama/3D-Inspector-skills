@@ -41,7 +41,7 @@ class BuildViewerTests(unittest.TestCase):
             self.assertEqual(result['triangles'],428)
             self.assertEqual(scene['original']['triangles'],428)
             self.assertTrue(all(x['dataUri'].startswith('data:image/png;base64,') for x in scene['textures']))
-            self.assertIn('Unlit' if False else 'Base texture',page.read_text())
+            self.assertIn('Base color',page.read_text())
             self.assertNotRegex(page.read_text(),r'<script\s+src=')
             self.assertNotIn('fetch(',page.read_text())
             self.assertEqual(scene['meshes'][0]['name'],'Box')
@@ -51,14 +51,31 @@ class BuildViewerTests(unittest.TestCase):
             page=Path(out)/'box.html'
             stats=build(FIXTURES/'synthetic.box.zip',page,grid=24)
             scene=scene_from_html(page)
-            self.assertEqual(stats['mode'],'surface')
-            self.assertGreater(stats['vertices'],100)
-            self.assertEqual(stats['meshes'],6)
+            self.assertEqual(stats['mode'],'native-box')
+            self.assertEqual(stats['vertices'],24)
+            self.assertEqual(stats['triangles'],12)
+            self.assertGreater(stats['fallbackVertices'],100)
+            self.assertEqual(stats['meshes'],1)
+            self.assertEqual(len(scene['meshes']),6)
             self.assertEqual(stats['textures'],11)
-            self.assertIn('not the native',scene['note'])
+            self.assertIn('Native three-impostor',scene['note'])
+            self.assertEqual(scene['nativeBox']['manifest']['layout'],'box')
+            for name,desc in scene['nativeBox']['manifest']['textures'].items():
+                payload=base64.b64decode(scene['nativeBox']['files'][desc['path']])
+                self.assertEqual(hashlib.sha256(payload).hexdigest(),desc['sha256'])
+            self.assertNotIn('__NATIVE_RUNTIME_JS__',page.read_text())
             self.assertEqual(scene['assetId'],'a'*64)
             self.assertGreater(scene['original']['triangles'],400)
             self.assertTrue(any(t['role'].startswith('R: roughness') for t in scene['textures']))
+
+    def test_legacy_renderer_is_explicitly_approximate(self):
+        with tempfile.TemporaryDirectory() as out:
+            page=Path(out)/'legacy.html'
+            stats=build(FIXTURES/'synthetic.box.zip',page,renderer='legacy',grid=24)
+            scene=scene_from_html(page)
+            self.assertEqual(stats['mode'],'surface')
+            self.assertNotIn('nativeBox',scene)
+            self.assertIn('not the native',scene['note'])
 
     def test_deterministic_html_and_title_sanitized(self):
         with tempfile.TemporaryDirectory() as out:
@@ -110,6 +127,41 @@ class BuildViewerTests(unittest.TestCase):
                     target.writestr(name,data)
             with self.assertRaisesRegex(ValueError,'checksum mismatch'):
                 build(archive,out/'viewer.html')
+
+
+    def test_box_depth_and_guide_integrity(self):
+        with tempfile.TemporaryDirectory() as out:
+            out=Path(out)
+            for kind in ('depth','guide'):
+                archive=out/('bad-'+kind+'.box.zip')
+                with zipfile.ZipFile(FIXTURES/'synthetic.box.zip') as source:
+                    m=json.loads(source.read('manifest.json'))
+                    member=m['faces']['+X'][kind]
+                    raw=source.read(member)
+                    m['faces']['+X'][kind+'Sha256']=hashlib.sha256(raw).hexdigest()
+                    with zipfile.ZipFile(archive,'w') as target:
+                        for name in source.namelist():
+                            data=source.read(name)
+                            if name==member:
+                                data=b'X'+data[1:]
+                            if name=='manifest.json':
+                                data=json.dumps(m).encode()
+                            target.writestr(name,data)
+                with self.assertRaisesRegex(ValueError,kind+' checksum mismatch'):
+                    build(archive,out/('bad-'+kind+'.html'))
+
+    def test_native_bundle_included_and_legacy_removed(self):
+        with tempfile.TemporaryDirectory() as out:
+            out=Path(out)
+            result=build(FIXTURES/'synthetic.box.zip',out/'native.html')
+            html=(out/'native.html').read_text()
+            self.assertEqual(result['renderer'],'Three.js / three-impostor')
+            self.assertEqual(result['triangles'],12)
+            self.assertNotIn('function initGL',html)
+            self.assertNotIn('__THIRD_PARTY_LICENSES__',html)
+            self.assertIn('Copyright (c) 2026 Richard Monette',html)
+            self.assertNotRegex(html,r'<script[^>]+src=')
+            self.assertNotIn('fetch(',html)
 
     def test_does_not_write_input_file(self):
         with tempfile.TemporaryDirectory() as out:

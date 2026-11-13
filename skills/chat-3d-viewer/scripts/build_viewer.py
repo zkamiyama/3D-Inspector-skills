@@ -107,12 +107,17 @@ def glb_scene(path, *, limit=250_000, texture_size=MAX_TEXTURE_SIZE):
             material = dict(name=name, baseColor=base, metallic=float(getattr(matobj,'metallicFactor',0) or 0),
                             roughness=float(getattr(matobj,'roughnessFactor',1) if getattr(matobj,'roughnessFactor',None) is not None else 1),
                             alphaMode=str(getattr(matobj,'alphaMode','OPAQUE') or 'OPAQUE'),
+                            alphaCutoff=float(getattr(matobj,'alphaCutoff',.5) or .5),
+                            emissiveFactor=quantized_color(getattr(matobj,'emissiveFactor',None)
+                                if getattr(matobj,'emissiveFactor',None) is not None else [0,0,0])[:3],
                             baseColorTexture=-1, normalTexture=-1, metallicRoughnessTexture=-1,
-                            emissiveTexture=-1, doubleSided=bool(getattr(matobj,'doubleSided',True)))
+                            emissiveTexture=-1, occlusionTexture=-1,
+                            doubleSided=bool(getattr(matobj,'doubleSided',True)))
             for attr, dest, role in [('baseColorTexture','baseColorTexture','Base color'),
                                      ('normalTexture','normalTexture','Normal'),
                                      ('metallicRoughnessTexture','metallicRoughnessTexture','Metallic / roughness'),
-                                     ('emissiveTexture','emissiveTexture','Emissive')]:
+                                     ('emissiveTexture','emissiveTexture','Emissive'),
+                                     ('occlusionTexture','occlusionTexture','AO')]:
                 img = getattr(matobj, attr, None)
                 if isinstance(img, Image.Image):
                     material[dest] = convert_texture(img, f'{name} · {role}', role, textures, max_size=texture_size)
@@ -198,7 +203,7 @@ def image_from_half(data,desc,*, color=False):
     return Image.fromarray(rgba,'RGBA')
 
 
-def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000):
+def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000, native=True):
     if not 8<=grid<=256:
         raise ValueError('Box surface grid must be 8–256')
     if path.stat().st_size>MAX_INPUT:
@@ -220,13 +225,21 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000):
             raise ValueError('Invalid Box bake bounds')
         textures=[]
         ids={}
+        raw_native={}
         color_atlas=None
+        if native and any(name not in m.get('textures',{}) for name in ('colorMap','normalMap','intervalMap','rangeMap')):
+            raise ValueError('Native Box requires color, normal, interval and range maps')
         for name in ['colorMap','normalMap','intervalMap','rangeMap','materialMap','emissiveMap']:
             desc=m.get('textures',{}).get(name)
             if not desc:continue
             data=archive.read(desc['path'])
             if hashlib.sha256(data).hexdigest()!=desc['sha256']:
                 raise ValueError('Box map checksum mismatch: '+name)
+            if native:
+                # Preserve original RGBA16F atlas bytes for the upstream
+                # Three.js/three-impostor raymarcher. PNGs below are just for
+                # the inspector's texture thumbnails.
+                raw_native[desc['path']]=base64.b64encode(data).decode('ascii')
             if name=='colorMap':
                 color_atlas=np.frombuffer(data,dtype='<f2').reshape(2*r,3*r,4).astype(np.float32)
             im=image_from_half(data,desc,color=name in ('colorMap','emissiveMap'))
@@ -240,10 +253,22 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000):
                 raise ValueError('Base color checksum mismatch')
             ids['baseColor']=convert_texture(image_from_half(data,base,color=True),'baseColor',CHANNEL_MAPS['baseColor'],textures,max_size=texture_size)
         for face in FACES:
-            g=m['faces'][face].get('guide')
+            item=m['faces'][face]
+            g=item.get('guide')
             if g and g in archive.namelist():
-                im=Image.open(io.BytesIO(archive.read(g)))
+                raw=archive.read(g)
+                if item.get('guideSha256') and hashlib.sha256(raw).hexdigest()!=item['guideSha256']:
+                    raise ValueError('Box guide checksum mismatch: '+face)
+                im=Image.open(io.BytesIO(raw))
                 convert_texture(im,'Guide '+face,'Orthographic guide',textures,max_size=texture_size)
+            depth_path=item.get('depth')
+            if not depth_path or depth_path not in archive.namelist():
+                raise ValueError('Missing Box depth: '+face)
+            depth=archive.read(depth_path)
+            if len(depth)!=r*r*2:
+                raise ValueError('Invalid Box depth size: '+face)
+            if item.get('depthSha256') and hashlib.sha256(depth).hexdigest()!=item['depthSha256']:
+                raise ValueError('Box depth checksum mismatch: '+face)
         mesh_data=[]
         selected = np.linspace(1,r-2,min(grid,r)).round().astype(np.int32)
         # Sampling on a grid; consistent with storage: raw atlas row 0 = shader V=0.
@@ -297,8 +322,11 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000):
                                   fallbackColors=buffer64(np.clip(col,0,255),np.uint8)))
         if not mesh_data:raise ValueError('No visible Box surface samples')
         material=dict(name='Box atlas',baseColor=[1,1,1,1],metallic=0,roughness=1,
+                      metallicSource='Material Map · G' if 'metalness' in m.get('maps',[]) else None,
+                      roughnessSource='Material Map · R' if 'roughness' in m.get('maps',[]) else None,
                       alphaMode='BLEND',baseColorTexture=ids['colorMap'],normalTexture=ids.get('normalMap',-1),
-                      metallicRoughnessTexture=ids.get('materialMap',-1),emissiveTexture=ids.get('emissiveMap',-1),doubleSided=True)
+                      metallicRoughnessTexture=ids.get('materialMap',-1),emissiveTexture=ids.get('emissiveMap',-1),
+                      occlusionTexture=-1,doubleSided=True)
         # Source proxy counts, if trimesh can inspect its native GLB.
         original={}
         try:
@@ -308,11 +336,18 @@ def box_scene(path, *, grid=72, texture_size=MAX_TEXTURE_SIZE, limit=250_000):
                           triangles=sum(len(x.faces) for x in proxy.geometry.values()))
         except Exception: original={}
         out=finalize_scene(path.name.removesuffix('.box.zip'),'Box impostor ZIP',mesh_data,[material],textures,
-                           description='Derived surface mesh',unit='bake unit',original=original,
-                           note='Preview geometry is sampled from the Box depth guides. It is not the native three-impostor ray-marched result.',
-                           previewType='surface', fixed_bounds=dims)
+                           description='Native ray-marched Box' if native else 'Derived surface mesh',
+                           unit='bake unit',original=original,
+                           note=('Native three-impostor ray marching via Three.js. If WebGL2 is unavailable, a sampled surface mesh is shown instead.'
+                                 if native else 'Preview geometry is sampled from Box depth guides, not the native three-impostor shader.'),
+                           previewType='native-box' if native else 'surface', fixed_bounds=dims)
         out['assetId']=m.get('asset_id')
         out['resolution']=r
+        if native:
+            out['nativeBox']={
+                'manifest': {key:m[key] for key in ('schemaVersion','layout','resolution','bakeBox','maps','textures')},
+                'files':raw_native,
+            }
         return out
 
 
@@ -330,11 +365,14 @@ def finalize_scene(name,fmt,meshes,materials,textures,*,description,unit,origina
 
 
 def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_triangles=250_000,
-          max_texture=MAX_TEXTURE_SIZE):
+          max_texture=MAX_TEXTURE_SIZE, renderer='native'):
     input_file=input_file.expanduser().resolve()
     if not input_file.is_file():raise ValueError('Input file does not exist: '+str(input_file))
+    if renderer not in ('native','legacy'):
+        raise ValueError('Renderer must be native or legacy')
     if input_file.name.lower().endswith('.box.zip'):
-        scene=box_scene(input_file,grid=grid,texture_size=max_texture,limit=max_triangles)
+        scene=box_scene(input_file,grid=grid,texture_size=max_texture,limit=max_triangles,
+                        native=renderer=='native')
     elif input_file.suffix.lower() in FORMATS:
         scene=glb_scene(input_file,limit=max_triangles,texture_size=max_texture)
     else:raise ValueError('Unsupported input format: '+input_file.name)
@@ -344,13 +382,34 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
     payload=base64.b64encode(compressed).decode('ascii')
     template=Path(__file__).resolve().parent.parent/'assets/viewer.html'
     html=template.read_text(encoding='utf-8').replace('__SCENE_PAYLOAD__',payload)
+    # Three.js, OrbitControls and three-impostor are compiled once at Skill
+    # release time from pinned NPM packages. No runtime CDN or scripts needed.
+    runtime=Path(__file__).resolve().parent.parent/'assets/native-runtime.bundle.js'
+    if renderer=='native':
+        if not runtime.is_file():
+            raise FileNotFoundError('Bundled Three.js runtime missing: '+str(runtime))
+        code=runtime.read_text(encoding='utf-8').replace('</script>','<\\/script>')
+    else:
+        code=''
+    html=html.replace('__NATIVE_RUNTIME_JS__',code)
+    notices=(Path(__file__).resolve().parent.parent/'assets/THIRD_PARTY_LICENSES.txt').read_text(encoding='utf-8')
+    html=html.replace('__THIRD_PARTY_LICENSES__', notices.replace('-->','-- >') if renderer=='native' else 'Legacy-only preview')
     output_file=output_file.expanduser().resolve()
     output_file.parent.mkdir(parents=True,exist_ok=True)
     output_file.write_text(html,encoding='utf-8')
+    fallback_vertices=sum(len(base64.b64decode(m['positions']))//12 for m in scene['meshes'])
+    fallback_triangles=sum(len(base64.b64decode(m['indices']))//12 for m in scene['meshes'])
+    native_box='nativeBox' in scene
     return dict(file=str(output_file),size=output_file.stat().st_size,
-                vertices=sum(len(base64.b64decode(m['positions']))//12 for m in scene['meshes']),
-                triangles=sum(len(base64.b64decode(m['indices']))//12 for m in scene['meshes']),
-                meshes=len(scene['meshes']),materials=len(scene['materials']),textures=len(scene['textures']),
+                vertices=24 if native_box else fallback_vertices,
+                triangles=12 if native_box else fallback_triangles,
+                meshes=1 if native_box else len(scene['meshes']),
+                materials=len(scene['materials']),textures=len(scene['textures']),
+                fallbackVertices=fallback_vertices if native_box else None,
+                fallbackTriangles=fallback_triangles if native_box else None,
+                sourceVertices=scene['original'].get('vertices'),
+                sourceTriangles=scene['original'].get('triangles'),
+                renderer='Three.js / three-impostor' if native_box else ('Three.js' if renderer=='native' else 'legacy'),
                 mode=scene['previewType'])
 
 
@@ -362,10 +421,12 @@ def main(argv=None):
     parser.add_argument('--grid',type=int,default=72,help='Box ZIP sampling grid 8–256 (default 72)')
     parser.add_argument('--max-triangles',type=int,default=250_000,help='Per mesh face cap')
     parser.add_argument('--max-texture',type=int,default=2048,help='Texture longest side in px')
+    parser.add_argument('--renderer',choices=['native','legacy'],default='native',
+                        help='native: Three.js and native Box ray marching; legacy: approximate fallback')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
     try: result=build(args.input,output,title=args.title,grid=args.grid,max_triangles=args.max_triangles,
-                      max_texture=args.max_texture)
+                      max_texture=args.max_texture,renderer=args.renderer)
     except Exception as exc:
         print('Error:',str(exc),file=sys.stderr)
         return 1
