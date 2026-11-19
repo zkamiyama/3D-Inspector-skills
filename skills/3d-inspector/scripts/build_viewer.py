@@ -512,8 +512,8 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         raise ValueError('Runtime source must be embedded or cdn')
     if box_lighting not in ('lit', 'unlit'):
         raise ValueError('Box lighting must be lit or unlit')
-    if box_color_sampling not in ('native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'):
-        raise ValueError('Box color sampling must be native, view, dominant, view-fade, view-soft or view-feather')
+    if box_color_sampling not in ('native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather', 'field-morph'):
+        raise ValueError('Box color sampling must be native, view, dominant, view-fade, view-soft, view-feather or field-morph')
     if box_shape_sampling not in ('native', 'interval-morph'):
         raise ValueError('Box shape sampling must be native or interval-morph')
     if not 0 <= box_morph_strength <= 1 or not 0 < box_morph_band_texels < float('inf'):
@@ -662,7 +662,7 @@ def main(argv=None):
                         help='native: Three.js and native Box ray marching; legacy: approximate fallback')
     parser.add_argument('--box-lighting', choices=['lit', 'unlit'], default='lit',
                         help='Box: lit material (default), or captured RGB with depth parallax and no relighting/tone mapping')
-    parser.add_argument('--box-color-sampling', choices=['native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'], default='native',
+    parser.add_argument('--box-color-sampling', choices=['native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather', 'field-morph'], default='native',
                         help='Box color selection: native surface weights, view angle blend, dominant visible view, or view-fade/view-soft/view-feather boundary blending')
     parser.add_argument('--box-shape-sampling', choices=['native', 'interval-morph'], default='native',
                         help='Box surface: native intersection or experimental angle-dependent interval-field morph')
