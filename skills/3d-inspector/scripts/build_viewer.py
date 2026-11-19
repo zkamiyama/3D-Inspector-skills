@@ -494,7 +494,8 @@ def blender_scene(path, max_triangles, max_points, max_texture, renderer):
 
 def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_triangles=250_000,
           max_texture=MAX_TEXTURE_SIZE, renderer='native', runtime_source='embedded',
-          max_points=500_000, box_lighting='lit', box_color_sampling='native'):
+          max_points=500_000, box_lighting='lit', box_color_sampling='native',
+          box_shape_sampling='native', box_morph_strength=1, box_morph_band_texels=8):
     input_file = input_file.expanduser().resolve()
     output_file = output_file.expanduser().resolve()
     if not input_file.is_file():
@@ -513,7 +514,11 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         raise ValueError('Box lighting must be lit or unlit')
     if box_color_sampling not in ('native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'):
         raise ValueError('Box color sampling must be native, view, dominant, view-fade, view-soft or view-feather')
-    custom_box_display = box_lighting == 'unlit' or box_color_sampling != 'native'
+    if box_shape_sampling not in ('native', 'interval-morph'):
+        raise ValueError('Box shape sampling must be native or interval-morph')
+    if not 0 <= box_morph_strength <= 1 or not 0 < box_morph_band_texels < float('inf'):
+        raise ValueError('Box morph strength must be 0–1 and its band must be positive and finite')
+    custom_box_display = box_lighting == 'unlit' or box_color_sampling != 'native' or box_shape_sampling != 'native'
     if custom_box_display and (renderer != 'native' or not input_file.name.lower().endswith('.box.zip')):
         raise ValueError('Custom Box display requires a .box.zip with the native renderer')
     suffix = input_file.suffix.lower()
@@ -565,8 +570,14 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
     if title:scene['name']=clean_name(title)
     if custom_box_display:
         scene['nativeBox']['display'] = {'lighting': box_lighting, 'sampling': 'native', 'colorSampling': box_color_sampling}
+        if box_shape_sampling != 'native':
+            scene['nativeBox']['display'].update(shapeSampling=box_shape_sampling,
+                                                morphStrength=box_morph_strength,
+                                                morphBandTexels=box_morph_band_texels)
         scene['description'] = 'RGB with depth parallax' if box_lighting == 'unlit' else 'Box with view-dependent color'
-        scene['note'] = 'Native depth ray marching. Color selection: ' + box_color_sampling + '. '
+        scene['note'] = ('Native depth ray marching. ' if box_shape_sampling == 'native'
+                         else 'Angle-dependent interval-field morph. ')
+        scene['note'] += 'Color selection: ' + box_color_sampling + '. '
         scene['note'] += 'Scene lighting and tone mapping are disabled.' if box_lighting == 'unlit' else 'Scene lighting is enabled.'
     data=json.dumps(scene,ensure_ascii=False,separators=(',',':'),allow_nan=False).replace('</script>','<\\/script>')
     compressed=zlib.compress(data.encode('utf-8'),level=9)
@@ -653,6 +664,12 @@ def main(argv=None):
                         help='Box: lit material (default), or captured RGB with depth parallax and no relighting/tone mapping')
     parser.add_argument('--box-color-sampling', choices=['native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'], default='native',
                         help='Box color selection: native surface weights, view angle blend, dominant visible view, or view-fade/view-soft/view-feather boundary blending')
+    parser.add_argument('--box-shape-sampling', choices=['native', 'interval-morph'], default='native',
+                        help='Box surface: native intersection or experimental angle-dependent interval-field morph')
+    parser.add_argument('--box-morph-strength', type=float, default=1,
+                        help='Interval morph strength from 0 to 1 (default 1)')
+    parser.add_argument('--box-morph-band-texels', type=float, default=8,
+                        help='Interval morph field band in texels along the shortest Box axis (default 8)')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
     # Some native CAD importers write diagnostics straight to file descriptor 1.
@@ -665,7 +682,9 @@ def main(argv=None):
             result = build(args.input, output, title=args.title, grid=args.grid,
                            max_triangles=args.max_triangles, max_texture=args.max_texture,
                            renderer=args.renderer, runtime_source=args.runtime_source,
-                           max_points=args.max_points, box_lighting=args.box_lighting, box_color_sampling=args.box_color_sampling)
+                           max_points=args.max_points, box_lighting=args.box_lighting, box_color_sampling=args.box_color_sampling,
+                           box_shape_sampling=args.box_shape_sampling, box_morph_strength=args.box_morph_strength,
+                           box_morph_band_texels=args.box_morph_band_texels)
         finally:
             sys.stdout.flush()
             os.dup2(result_fd, 1)
