@@ -511,8 +511,8 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         raise ValueError('Runtime source must be embedded or cdn')
     if box_lighting not in ('lit', 'unlit'):
         raise ValueError('Box lighting must be lit or unlit')
-    if box_color_sampling not in ('native', 'view', 'dominant'):
-        raise ValueError('Box color sampling must be native, view or dominant')
+    if box_color_sampling not in ('native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'):
+        raise ValueError('Box color sampling must be native, view, dominant, view-fade, view-soft or view-feather')
     custom_box_display = box_lighting == 'unlit' or box_color_sampling != 'native'
     if custom_box_display and (renderer != 'native' or not input_file.name.lower().endswith('.box.zip')):
         raise ValueError('Custom Box display requires a .box.zip with the native renderer')
@@ -651,8 +651,8 @@ def main(argv=None):
                         help='native: Three.js and native Box ray marching; legacy: approximate fallback')
     parser.add_argument('--box-lighting', choices=['lit', 'unlit'], default='lit',
                         help='Box: lit material (default), or captured RGB with depth parallax and no relighting/tone mapping')
-    parser.add_argument('--box-color-sampling', choices=['native', 'view', 'dominant'], default='native',
-                        help='Box color selection: native surface weights, view angle blend, or dominant visible view')
+    parser.add_argument('--box-color-sampling', choices=['native', 'view', 'dominant', 'view-fade', 'view-soft', 'view-feather'], default='native',
+                        help='Box color selection: native surface weights, view angle blend, dominant visible view, or view-fade/view-soft/view-feather boundary blending')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
     # Some native CAD importers write diagnostics straight to file descriptor 1.
