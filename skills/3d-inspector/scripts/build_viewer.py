@@ -590,7 +590,7 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         if profile in ('native', 'splat', 'splat-ply'):
             modules['three/tsl'] = three + 'build/three.tsl.js'
         if profile == 'native':
-            modules['three-impostor'] = 'https://cdn.jsdelivr.net/npm/three-impostor@0.4.1/Impostor.js'
+            modules['three-impostor'] = 'https://cdn.jsdelivr.net/npm/three-impostor@0.4.2/Impostor.js'
         imports = {'imports': modules}
         bootstrap=(
             '<script type="importmap">'+json.dumps(imports,separators=(',',':'))+'</script>\n'
