@@ -494,7 +494,7 @@ def blender_scene(path, max_triangles, max_points, max_texture, renderer):
 
 def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_triangles=250_000,
           max_texture=MAX_TEXTURE_SIZE, renderer='native', runtime_source='embedded',
-          max_points=500_000):
+          max_points=500_000, box_lighting='lit'):
     input_file = input_file.expanduser().resolve()
     output_file = output_file.expanduser().resolve()
     if not input_file.is_file():
@@ -509,6 +509,10 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
         raise ValueError('Renderer must be native or legacy')
     if runtime_source not in ('embedded','cdn'):
         raise ValueError('Runtime source must be embedded or cdn')
+    if box_lighting not in ('lit', 'unlit'):
+        raise ValueError('Box lighting must be lit or unlit')
+    if box_lighting == 'unlit' and (renderer != 'native' or not input_file.name.lower().endswith('.box.zip')):
+        raise ValueError('Unlit Box lighting requires a .box.zip with the native renderer')
     suffix = input_file.suffix.lower()
     if suffix == '.3mf':
         with zipfile.ZipFile(input_file) as archive:
@@ -556,6 +560,10 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
     else:
         raise ValueError('Unsupported input format: ' + input_file.name)
     if title:scene['name']=clean_name(title)
+    if box_lighting == 'unlit':
+        scene['nativeBox']['display'] = {'lighting': 'unlit', 'sampling': 'native'}
+        scene['description'] = 'RGB with depth parallax'
+        scene['note'] = 'Captured RGB with native depth ray marching. Scene lighting and tone mapping are disabled.'
     data=json.dumps(scene,ensure_ascii=False,separators=(',',':'),allow_nan=False).replace('</script>','<\\/script>')
     compressed=zlib.compress(data.encode('utf-8'),level=9)
     payload=base64.b64encode(compressed).decode('ascii')
@@ -567,7 +575,8 @@ def build(input_file: Path, output_file: Path, *, title=None, grid=72, max_trian
     code = ''
     if renderer == 'native':
         suffix = 'cdn.mjs' if runtime_source == 'cdn' else 'bundle.js'
-        runtime = assets / f'{profile}-runtime.{suffix}'
+        runtime_profile = 'native-rgb' if profile == 'native' and box_lighting == 'unlit' else profile
+        runtime = assets / f'{runtime_profile}-runtime.{suffix}'
         code = runtime.read_text(encoding='utf-8').replace('</script>', '<\\/script>')
     if renderer == 'native' and runtime_source == 'cdn':
         three = 'https://cdn.jsdelivr.net/npm/three@0.186.0/'
@@ -636,6 +645,8 @@ def main(argv=None):
                         help='embedded (offline) or CDN ESM imports; model data is always embedded')
     parser.add_argument('--renderer',choices=['native','legacy'],default='native',
                         help='native: Three.js and native Box ray marching; legacy: approximate fallback')
+    parser.add_argument('--box-lighting', choices=['lit', 'unlit'], default='lit',
+                        help='Box: lit material (default), or captured RGB with depth parallax and no relighting/tone mapping')
     args=parser.parse_args(argv)
     output=args.output or Path(args.input.name+'.inspector.html')
     # Some native CAD importers write diagnostics straight to file descriptor 1.
@@ -648,7 +659,7 @@ def main(argv=None):
             result = build(args.input, output, title=args.title, grid=args.grid,
                            max_triangles=args.max_triangles, max_texture=args.max_texture,
                            renderer=args.renderer, runtime_source=args.runtime_source,
-                           max_points=args.max_points)
+                           max_points=args.max_points, box_lighting=args.box_lighting)
         finally:
             sys.stdout.flush()
             os.dup2(result_fd, 1)
